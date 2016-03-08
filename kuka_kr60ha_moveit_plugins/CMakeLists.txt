@@ -32,7 +32,7 @@ install(TARGETS ${IKFAST_LIBRARY_NAME} LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_
 
 install(
   FILES
-  kuka_kr60_ha_manipulator_moveit_ikfast_plugin_description.xml
+  kuka_kr60ha_manipulator_moveit_ikfast_plugin_description.xml
   DESTINATION
   ${CATKIN_PACKAGE_SHARE_DESTINATION}
 )

@@ -163,7 +163,14 @@
     </link>
     <!-- tool 0 -->
     <!-- This frame corresponds to the $FLANGE coordinate system in KUKA KRC controllers. -->
-    <link name="${prefix}tool0"/>
+    <link name="${prefix}tool0">
+      <collision>
+	<origin xyz="0 0 0" rpy="0 0 0"/>
+	<geometry>
+	  <sphere radius="0.001"/>
+	</geometry>
+      </collision>
+    </link>
     <!-- END LINKS -->
 
     <!-- JOINTS -->
