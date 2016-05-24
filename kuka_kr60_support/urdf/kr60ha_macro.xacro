@@ -87,7 +87,7 @@
       <visual>
         <origin xyz="0 0 0" rpy="0 0 0"/>
         <geometry>
-          <mesh filename="package://kuka_kr60_support/meshes/kr60ha/visual/link_3.dae" />
+          <mesh filename="package://kuka_kr60_support/meshes/kr60ha/visual/link_3.stl" />
         </geometry>
 	
       </visual>
