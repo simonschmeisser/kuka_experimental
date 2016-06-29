@@ -50,6 +50,8 @@
 #include <urdf/model.h>
 #include <tf_conversions/tf_kdl.h>
 
+#include <algorithm>
+
 // Need a floating point tolerance when checking joint limits, in case the joint starts at limit
 const double LIMIT_TOLERANCE = .0000001;
 /// \brief Search modes for searchPositionIK(), see there
@@ -147,6 +149,23 @@ public:
   bool getPositionIK(const geometry_msgs::Pose &ik_pose,
                      const std::vector<double> &ik_seed_state,
                      std::vector<double> &solution,
+                     moveit_msgs::MoveItErrorCodes &error_code,
+                     const kinematics::KinematicsQueryOptions &options = kinematics::KinematicsQueryOptions()) const;
+
+
+  /**
+   * @brief Given a desired pose of the end-effector, compute the joint angles to reach it
+   * @param ik_pose the desired pose of the link
+   * @param ik_seed_state an initial guess solution for the inverse kinematics
+   * @param solution the solution vector
+   * @param error_code an error code that encodes the reason for failure or success
+   * @return True if a valid solution was found, false otherwise
+   */
+
+  // Returns the first IK solution that is within joint limits, this is called by get_ik() service
+  bool getPositionIKs(const geometry_msgs::Pose &ik_pose,
+                     const std::vector<double> &ik_seed_state,
+                     std::vector<std::vector<double> > &solution,
                      moveit_msgs::MoveItErrorCodes &error_code,
                      const kinematics::KinematicsQueryOptions &options = kinematics::KinematicsQueryOptions()) const;
 
@@ -677,6 +696,29 @@ bool IKFastKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose
                           options);
 }
 
+template <typename T, typename Compare>
+std::vector<std::size_t> sort_permutation(
+    const std::vector<T>& vec,
+    Compare compare)
+{
+    std::vector<std::size_t> p(vec.size());
+    std::iota(p.begin(), p.end(), 0);
+    std::sort(p.begin(), p.end(),
+        [&](std::size_t i, std::size_t j){ return compare(vec[i], vec[j]); });
+    return p;
+}
+
+template <typename T>
+std::vector<T> apply_permutation(
+    const std::vector<T>& vec,
+    const std::vector<std::size_t>& p)
+{
+    std::vector<T> sorted_vec(p.size());
+    std::transform(p.begin(), p.end(), sorted_vec.begin(),
+        [&](std::size_t i){ return vec[i]; });
+    return sorted_vec;
+}
+
 bool IKFastKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose,
                                               const std::vector<double> &ik_seed_state,
                                               double timeout,
@@ -700,23 +742,56 @@ bool IKFastKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose
     ROS_DEBUG_STREAM_NAMED("ikfast","No need to search since no free params/redundant joints");
 
     // Find first IK solution, within joint limits
-    if(!getPositionIK(ik_pose, ik_seed_state, solution, error_code))
+    std::vector< std::vector<double> > solutions;
+
+    if(!getPositionIKs(ik_pose, ik_seed_state, solutions, error_code))
     {
       ROS_DEBUG_STREAM_NAMED("ikfast","No solution whatsoever");
       error_code.val = moveit_msgs::MoveItErrorCodes::NO_IK_SOLUTION;
       return false;
     }
 
+    std::vector<double> distances;
+    for (int i = 0; i < solutions.size(); ++i) {
+        solution = solutions[i];
+        double dist = 0;
+        for (int j = 0; j < solution.size(); ++j) {
+            dist += std::abs(solution[j] - ik_seed_state[j]);
+        }
+        distances.push_back(dist);
+    }
+
+    auto p = sort_permutation(distances,
+        [](double const& a, double const& b){ return a < b; });
+
+//    std::cout << "distances : " << std::endl;
+//    for (double d : distances)
+//        std::cout << d << std::endl;
+
+    distances = apply_permutation(distances, p);
+    solutions = apply_permutation(solutions, p);
+
+
+//    std::cout << "distances : " << std::endl;
+//    for (double d : distances)
+//        std::cout << d << std::endl;
+
+
     // check for collisions if a callback is provided
     if( !solution_callback.empty() )
     {
-      solution_callback(ik_pose, solution, error_code);
-      if(error_code.val == moveit_msgs::MoveItErrorCodes::SUCCESS)
-      {
-        ROS_DEBUG_STREAM_NAMED("ikfast","Solution passes callback");
-        return true;
-      }
-      else
+        for (int i = 0; i < solutions.size(); ++i) {
+            solution = solutions[i];
+            solution_callback(ik_pose, solution, error_code);
+            if(error_code.val == moveit_msgs::MoveItErrorCodes::SUCCESS)
+            {
+              ROS_DEBUG_STREAM_NAMED("ikfast","Solution passes callback");
+              return true;
+            }
+        }
+
+
+      //else
       {
         ROS_DEBUG_STREAM_NAMED("ikfast","Solution has error code " << error_code);
         return false;
@@ -724,6 +799,7 @@ bool IKFastKinematicsPlugin::searchPositionIK(const geometry_msgs::Pose &ik_pose
     }
     else
     {
+        solution = solutions[0]; //return closest solution by default
       return true; // no collision check callback provided
     }
   }
@@ -918,7 +994,7 @@ bool IKFastKinematicsPlugin::getPositionIK(const geometry_msgs::Pose &ik_pose,
 
   if(!active_)
   {
-    ROS_ERROR("kinematics not active");    
+    ROS_ERROR("kinematics not active");
     return false;
   }
 
@@ -940,15 +1016,25 @@ bool IKFastKinematicsPlugin::getPositionIK(const geometry_msgs::Pose &ik_pose,
   IkSolutionList<IkReal> solutions;
   int numsol = solve(frame,vfree,solutions);
 
+
+  ROS_ERROR("Found %i solutions from IKFast", numsol);
   ROS_DEBUG_STREAM_NAMED("ikfast","Found " << numsol << " solutions from IKFast");
 
   if(numsol)
   {
+      for(int s = 0; s < numsol; ++s)
+      {
+        std::vector<double> sol;
+        getSolution(solutions,s,sol);
+        ROS_ERROR("Sol %d: %e   %e   %e   %e   %e   %e", s, sol[0]/M_PI*180, sol[1]/M_PI*180, sol[2]/M_PI*180, sol[3]/M_PI*180, sol[4]/M_PI*180, sol[5]/M_PI*180);
+      }
+
     for(int s = 0; s < numsol; ++s)
     {
       std::vector<double> sol;
       getSolution(solutions,s,sol);
       ROS_DEBUG_NAMED("ikfast","Sol %d: %e   %e   %e   %e   %e   %e", s, sol[0], sol[1], sol[2], sol[3], sol[4], sol[5]);
+      ROS_ERROR("Sol %d: %e   %e   %e   %e   %e   %e", s, sol[0], sol[1], sol[2], sol[3], sol[4], sol[5]);
 
       bool obeys_limits = true;
       for(unsigned int i = 0; i < sol.size(); i++)
@@ -959,6 +1045,7 @@ bool IKFastKinematicsPlugin::getPositionIK(const geometry_msgs::Pose &ik_pose,
         {
           // One element of solution is not within limits
           obeys_limits = false;
+          ROS_ERROR("Not in limits!");
           ROS_DEBUG_STREAM_NAMED("ikfast","Not in limits! " << i << " value " << sol[i] << " has limit: " << joint_has_limits_vector_[i] << "  being  " << joint_min_vector_[i] << " to " << joint_max_vector_[i]);
           break;
         }
@@ -974,6 +1061,98 @@ bool IKFastKinematicsPlugin::getPositionIK(const geometry_msgs::Pose &ik_pose,
         error_code.val = moveit_msgs::MoveItErrorCodes::SUCCESS;
         return true;
       }
+    }
+  }
+  else
+  {
+    ROS_DEBUG_STREAM_NAMED("ikfast","No IK solution");
+  }
+
+  error_code.val = moveit_msgs::MoveItErrorCodes::NO_IK_SOLUTION;
+  return false;
+}
+
+// Used when there are no redundant joints - aka no free params
+bool IKFastKinematicsPlugin::getPositionIKs(const geometry_msgs::Pose &ik_pose,
+                                           const std::vector<double> &ik_seed_state,
+                                           std::vector<std::vector<double> > &solution,
+                                           moveit_msgs::MoveItErrorCodes &error_code,
+                                           const kinematics::KinematicsQueryOptions &options) const
+{
+  ROS_DEBUG_STREAM_NAMED("ikfast","getPositionIK");
+
+  if(!active_)
+  {
+    ROS_ERROR("kinematics not active");
+    return false;
+  }
+
+  std::vector<double> vfree(free_params_.size());
+  for(std::size_t i = 0; i < free_params_.size(); ++i)
+  {
+    int p = free_params_[i];
+    ROS_ERROR("%u is %f",p,ik_seed_state[p]);  // DTC
+
+    //WORKAROUND J1 neg
+    vfree[i] = (i == 0) ? -ik_seed_state[p] : ik_seed_state[p];
+    //was
+    //vfree[i] = ik_seed_state[p];
+  }
+
+  KDL::Frame frame;
+  tf::poseMsgToKDL(ik_pose,frame);
+
+  IkSolutionList<IkReal> solutions;
+  int numsol = solve(frame,vfree,solutions);
+
+
+//  ROS_ERROR("Found %i solutions from IKFast", numsol);
+  ROS_DEBUG_STREAM_NAMED("ikfast","Found " << numsol << " solutions from IKFast");
+
+  if(numsol)
+  {
+//      for(int s = 0; s < numsol; ++s)
+//      {
+//        std::vector<double> sol;
+//        getSolution(solutions,s,sol);
+//        ROS_ERROR("Sol %d: %e   %e   %e   %e   %e   %e", s, sol[0]/M_PI*180, sol[1]/M_PI*180, sol[2]/M_PI*180, sol[3]/M_PI*180, sol[4]/M_PI*180, sol[5]/M_PI*180);
+//      }
+
+    for(int s = 0; s < numsol; ++s)
+    {
+      std::vector<double> sol;
+      getSolution(solutions,s,sol);
+      ROS_DEBUG_NAMED("ikfast","Sol %d: %e   %e   %e   %e   %e   %e", s, sol[0], sol[1], sol[2], sol[3], sol[4], sol[5]);
+//      ROS_ERROR("Sol %d: %e   %e   %e   %e   %e   %e", s, sol[0], sol[1], sol[2], sol[3], sol[4], sol[5]);
+
+      bool obeys_limits = true;
+      for(unsigned int i = 0; i < sol.size(); i++)
+      {
+        // Add tolerance to limit check
+        if(joint_has_limits_vector_[i] && ( (sol[i] < (joint_min_vector_[i]-LIMIT_TOLERANCE)) ||
+                                            (sol[i] > (joint_max_vector_[i]+LIMIT_TOLERANCE)) ) )
+        {
+          // One element of solution is not within limits
+          obeys_limits = false;
+//          ROS_ERROR("Not in limits!");
+          ROS_DEBUG_STREAM_NAMED("ikfast","Not in limits! " << i << " value " << sol[i] << " has limit: " << joint_has_limits_vector_[i] << "  being  " << joint_min_vector_[i] << " to " << joint_max_vector_[i]);
+          break;
+        }
+      }
+      if(obeys_limits)
+      {
+        // All elements of solution obey limits
+
+        // WORKAROUND J1 neg
+        sol[0] *= -1.0;
+
+        solution.push_back(sol);
+
+      }
+    }
+    if (solution.size() > 0) {
+        error_code.val = moveit_msgs::MoveItErrorCodes::SUCCESS;
+        return true;
     }
   }
   else
